@@ -4,31 +4,16 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define PORT 4221
-#define CRLF_SIZE 2
 #define MAX_BUFFER 4024
 #define MAX_HEADERS 1024
 
-struct PathDetails {
-  int present;
-  char* param;
-  char* path;
-  int paramSize;
-};
-
-struct HeaderDetails {
-  int present;
-  char* value;
-  char* name;
-  int size;
-};
-
-enum HttpMethod {
-  GET = 0,
-  POST = 1,
-  PUT = 2,
-  DELETE = 3,
+struct FunctionRequest {
+  int client_socket_fd;
+  char* absolutePath;
+  int absolutePathSize;
 };
 
 struct Request {
@@ -55,7 +40,7 @@ void parse_request(char* request_buff, struct Request * req, char * base_endpoin
     base_endpoint = "/";
   }
   
-  /* SETTING METHOD */
+  // SETTING METHOD
   char * status_line_start = request_buff;
   char * http_method_line_end = strstr(request_buff, " /");
 
@@ -65,15 +50,15 @@ void parse_request(char* request_buff, struct Request * req, char * base_endpoin
   
   char * status_line_end = strstr(request_buff, "HTTP/1.1\r\n");
 
-  /* SETTING ENDPOINT */
+  // SETTING ENDPOINT
   req->__endpoint = (char *)malloc(status_line_end - 1 - (http_method_line_end + 1) + 1); // +1 for null terminator
   strncpy(req->__endpoint, http_method_line_end + 1, status_line_end - 1 - (http_method_line_end + 1));
   req->__endpoint[status_line_end - 1 - (http_method_line_end + 1)] = '\0'; // Add null terminator
   
-  /* SETTING PARAM */
+  // SETTING PARAM 
   char * param_start = strstr(req->__endpoint, base_endpoint);
 
-  if (param_start != NULL && param_start == req->__endpoint) { // Check if base_endpoint is at the start
+  if (param_start != NULL && param_start == req->__endpoint) { // Checking if "base_endpoint" is at the start
     req->__base_endpoint = strdup(base_endpoint);
 
     if (strlen(req->__endpoint) > strlen(base_endpoint)) {
@@ -85,12 +70,12 @@ void parse_request(char* request_buff, struct Request * req, char * base_endpoin
         
         // Check if the param contains any additional path segments
         if (strchr(param_start, '/') != NULL) {
-          // Multiple segments after the base_endpoint (e.g., "/user-agent/user1/user2")
+          // Multiple segments after the base_endpoint like => "/user-agent/user1/user2"
           req->__base_endpoint_exists = 0;
           req->__param = (char *)malloc(strlen(param_start) + 1);
           strcpy(req->__param, param_start);
         } else {
-          // Only one segment after the base_endpoint (e.g., "/user-agent/user1")
+          // Only one segment after the base_endpoint like => "/user-agent/user1"
           req->__param = (char *)malloc(strlen(param_start) + 1);
           strcpy(req->__param, param_start);
         }
@@ -99,7 +84,6 @@ void parse_request(char* request_buff, struct Request * req, char * base_endpoin
         req->__param[0] = '\0';
       }
     } else {
-      // Exact match, empty param
       req->__param = (char *)malloc(1);
       req->__param[0] = '\0';
     }
@@ -107,7 +91,7 @@ void parse_request(char* request_buff, struct Request * req, char * base_endpoin
     req->__base_endpoint_exists = 0;
   }
 
-  /* SETTING HEADERS */
+  // SETTING HEADERS
   char * header_start = strstr(req->__request, "\r\n");
   req->__headers = (char **) malloc(MAX_HEADERS * sizeof(char *));
 
@@ -145,7 +129,7 @@ void parse_request(char* request_buff, struct Request * req, char * base_endpoin
     req->__header_count = 0;
   }
 
-  /* SETTING BODY */
+  // SETTING BODY
   char * body_start = strstr(request_buff, "\r\n\r\n");
   
   if (body_start != NULL) {
@@ -165,6 +149,170 @@ void parse_request(char* request_buff, struct Request * req, char * base_endpoin
     req->__body = (char *) malloc(1);
     req->__body[0] = '\0';
   }
+}
+
+void* handle_client(void* functionRequest) {
+  char request[4096];
+  char response[1024];
+
+  struct FunctionRequest* parsedFunctionRequest = (struct FunctionRequest*)functionRequest;
+
+  int parsed_client_fd = parsedFunctionRequest->client_socket_fd;
+
+  int bytes_read = recv(parsed_client_fd, (char *) request, sizeof (request), 0);
+
+  if (bytes_read < 0) {
+    printf("Cannot Read Incoming Request!\n");
+    close(parsed_client_fd);
+    exit(1);
+  }
+
+  request[bytes_read] = '\0';
+
+  struct Request req_for_home, req_for_user_agent, req_for_echo, req_for_files;
+  
+  parse_request(request, &req_for_home, "/");
+  parse_request(request, &req_for_user_agent, "/user-agent");
+  parse_request(request, &req_for_echo, "/echo");
+  parse_request(request, &req_for_files, "/files");
+  
+  printf("Incoming Request: %s\n", request);
+  
+  if (req_for_echo.__base_endpoint_exists == 1) {
+    printf("http://localhost:%d/echo\n", PORT);
+    snprintf(
+      response,
+      sizeof(response),
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: text/plain\r\n"
+      "Content-Length: %lu\r\n\r\n"
+      "%s",
+      strlen(req_for_echo.__param),
+      req_for_echo.__param
+    );
+  } else if (req_for_user_agent.__base_endpoint_exists == 1) {
+    printf("http://localhost:%d/user-agent\n", PORT);
+    char* header_user_agent;
+
+    for (int idx = 0; idx < req_for_user_agent.__header_count; idx++) {
+      char * header_present = strstr(req_for_user_agent.__headers[idx], "User-Agent: ");
+
+      if (header_present != NULL) {
+        char * header_value_start = header_present + strlen("User-Agent: ");
+        char * header_value = (char *) malloc(strlen(req_for_user_agent.__headers[idx]) - strlen("User-Agent: ") + 1);
+        strcpy(header_value, header_value_start);
+
+        header_value[strlen(req_for_user_agent.__headers[idx]) - strlen("User-Agent: ")] = '\0';
+  
+        snprintf(
+          response,
+          sizeof(response),
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/plain\r\n"
+          "Content-Length: %lu\r\n\r\n"
+          "%s",
+          strlen(header_value),
+          header_value
+        );
+        break;
+      } 
+      else {
+        snprintf(
+          response,
+          sizeof(response),
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/plain\r\n"
+          "Content-Length: 0\r\n\r\n"
+          ""
+        );
+      }
+    }
+  } else if (req_for_files.__base_endpoint_exists == 1) {
+    printf("http://localhost:%d/files\n", PORT);
+
+    char *fileName = malloc(strlen(parsedFunctionRequest->absolutePath) + strlen(req_for_files.__param) + 1);
+
+    // req_for_files.__param;
+    char absolutePath[parsedFunctionRequest->absolutePathSize];
+    strncpy(absolutePath, parsedFunctionRequest->absolutePath, parsedFunctionRequest->absolutePathSize);
+
+    snprintf(
+      fileName,
+      strlen(absolutePath) + strlen(req_for_files.__param) + 1,
+      "%s%s",
+      absolutePath,
+      req_for_files.__param
+    );
+
+    printf("File Name: %s\n", fileName);
+    FILE *file = fopen(fileName, "r");
+
+    if (file == NULL) {
+      snprintf(
+        response, 
+        sizeof(response), 
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: 0\r\n\r\n"
+        ""
+      );
+    } else {
+      char line[1024] = {0};
+
+      size_t content_length = 0;
+      size_t bytes_read;
+      
+      // Read the entire file into the line buffer
+      while (
+        (bytes_read = fread(line + content_length, 1, sizeof(line) - content_length - 1, file)) > 0
+      ) {
+        content_length += bytes_read;
+
+        if (content_length >= sizeof(line) - 1) {
+          break;
+        }
+      }
+
+      line[content_length] = '\0';
+
+      printf("File Content: %s\n", line);
+
+      snprintf(
+        response, 
+        sizeof(response), 
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: %zu\r\n\r\n"
+        "%s",
+        content_length,
+        line
+      );
+      fclose(file);
+    }
+  } else if (req_for_home.__base_endpoint_exists == 1 && strncmp(req_for_home.__endpoint, "/", strlen(req_for_home.__endpoint)) == 0) {
+    printf("http://localhost:%d/\n", PORT);
+    snprintf(
+      response,
+      sizeof(response),
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: text/plain\r\n"
+      "Content-Length: 0\r\n\r\n"
+    );
+  } else {
+    printf("PATH NOT-FOUND\n");
+    snprintf(
+      response,
+      sizeof(response),
+      "HTTP/1.1 404 Not Found\r\n\r\n"
+      "Content-Type: text/plain\r\n"
+      "Content-Length: 0\r\n\r\n"
+    );
+  }
+
+  send(parsed_client_fd, response, sizeof (response), 0);
+  // close(parsed_client_fd);
+
+  return functionRequest;
 }
 
 void display(const struct Request * req) {
@@ -198,9 +346,11 @@ void display(const struct Request * req) {
   }
 }
 
-int main () {
+int main (int argc, char* argv[]) {
 	setbuf(stdout, NULL);
   setbuf(stderr, NULL);
+
+  char* absolutePath = argv[argc - 1];
 
   int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -248,131 +398,22 @@ int main () {
       continue;
     }
 
-    pid_t pid = fork();
-    printf("Assigned Pid = %d\n", pid);
+    pthread_t thread_id;
 
-    if (pid < 0) {
+    struct FunctionRequest functionRequest = {
+      .client_socket_fd = client_socket_fd,
+      .absolutePath = absolutePath,
+      .absolutePathSize = strlen(absolutePath),
+    };
+
+    if (pthread_create(&thread_id, NULL, handle_client, (void*) &functionRequest) != 0) {
       perror("Fork failed\n");
       close(client_socket_fd);
       continue;
     }
-
-    if (pid == 0) {
-      /* Child process - handle the client request */
-      close(socket_fd); // Close listening socket in child
-
-      char request[4096];
-      char response[1024];
-
-
-      int bytes_read = recv(client_socket_fd, (char *) request, sizeof (request), 0);
-
-      if (bytes_read < 0) {
-        printf("Cannot Read Incoming Request!\n");
-        close(client_socket_fd);
-        exit(1);
-      }
-
-      // Null-terminate the request
-      request[bytes_read] = '\0';
-
-      // FOR Stage 1, 2, 3, 4, 5
-      struct Request req_for_home, req_for_user_agent, req_for_echo;
-      
-      parse_request(request, &req_for_home, "/");
-      parse_request(request, &req_for_user_agent, "/user-agent");
-      parse_request(request, &req_for_echo, "/echo");
-      
-      display(&req_for_home);
-      printf("%s and %d\n", req_for_home.__endpoint, strncmp(req_for_home.__endpoint, "/", strlen(req_for_home.__endpoint)) == 0);
-      
-      printf("REQUEST = %s\n", request);
-      
-      if (req_for_echo.__base_endpoint_exists == 1) {
-        printf("WELCOME TO ECHO\n");
-        snprintf(
-          response,
-          sizeof(response),
-          "HTTP/1.1 200 OK\r\n"
-          "Content-Type: text/plain\r\n"
-          "Content-Length: %lu\r\n\r\n"
-          "%s",
-          strlen(req_for_echo.__param),
-          req_for_echo.__param
-        );
-      } 
-      else if (req_for_user_agent.__base_endpoint_exists == 1) {
-        printf("WELCOME TO USER-AGENT\n");
-        char* header_user_agent;
-      
-        for (int idx = 0; idx < req_for_user_agent.__header_count; idx++) {
-          char * header_present = strstr(req_for_user_agent.__headers[idx], "User-Agent: ");
-          if (header_present != NULL) {
-            char * header_value_start = header_present + strlen("User-Agent: ");
-            char * header_value = (char *) malloc(strlen(req_for_user_agent.__headers[idx]) - strlen("User-Agent: ") + 1);
-        
-            strncpy(header_value, header_value_start, strlen(req_for_user_agent.__headers[idx]) - strlen("User-Agent: "));
-            header_value[strlen(req_for_user_agent.__headers[idx]) - strlen("User-Agent: ")] = '\0';
-      
-            snprintf(
-              response,
-              sizeof(response),
-              "HTTP/1.1 200 OK\r\n"
-              "Content-Type: text/plain\r\n"
-              "Content-Length: %lu\r\n\r\n"
-              "%s",
-              strlen(header_value),
-              header_value
-            );
-            break;
-          } 
-          else {
-            snprintf(
-              response,
-              sizeof(response),
-              "HTTP/1.1 200 OK\r\n"
-              "Content-Type: text/plain\r\n"
-              "Content-Length: 0\r\n\r\n"
-              ""
-            );
-          }
-        }
-      } else if (req_for_home.__base_endpoint_exists == 1 && strncmp(req_for_home.__endpoint, "/", strlen(req_for_home.__endpoint)) == 0) {
-        printf("WELCOME TO HOME\n");
-        snprintf(
-          response,
-          sizeof(response),
-          "HTTP/1.1 200 OK\r\n"
-          "Content-Type: text/plain\r\n"
-          "Content-Length: 0\r\n\r\n"
-        );
-      }
-      else {
-        printf("WELCOME TO NOT-FOUND\n");
-        snprintf(
-          response,
-          sizeof(response),
-          "HTTP/1.1 404 Not Found\r\n\r\n"
-          "Content-Type: text/plain\r\n"
-          "Content-Length: 0\r\n\r\n"
-        );
-      
-      }
-
-      // For Stage 6
-      snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\n\r\n");
-      send(client_socket_fd, response, sizeof (response), 0);
-
-      close(client_socket_fd);
-      exit(0); // Child process exits after handling the request
-
-    } else {
-      // Parent process - continue accepting new connections
-      close(client_socket_fd); // Close client socket in parent
-    }
+    pthread_detach(thread_id);
   }
 
   close(socket_fd);
-
   return 0;
 }
